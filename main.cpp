@@ -1,14 +1,14 @@
 #include <iostream>
-#include "unpthread.h"
 #include "room.h"
+#include "thread_pool.h"
+#include <memory>
 
-Thread *tptr;
 socklen_t addrlen = sizeof(sockaddr);
 int listenfd;
 int nprocesses, nthreads;
 Room *room;
 void sig_chld(int signo);
-void thread_make(int);
+// void thread_make(int);
 void process_make(int, int);
 
 int main(int argc, char **argv) {
@@ -34,7 +34,7 @@ int main(int argc, char **argv) {
     room = new Room(nprocesses);
     printf("total threads: %d   total processes: %d\n", nthreads, nprocesses);
 
-    tptr = (Thread *) Calloc(nthreads, sizeof(Thread));
+    // tptr = (Thread *) Calloc(nthreads, sizeof(Thread));
 
     // 房间进程池
     for (int i = 0; i < nprocesses; i++) {
@@ -44,8 +44,9 @@ int main(int argc, char **argv) {
     }
 
     // 线程池
+    ThreadPool threadPool;
     for (int i = 0; i < nthreads; i++) {
-        thread_make(i);
+        threadPool.submit(thread_main);
     }
 
     while (true) {
@@ -64,16 +65,22 @@ int main(int argc, char **argv) {
                 printf("c = %c\n", rc);
                 if (rc == 'E') {
                     // 房间变空
-                    Pthread_mutex_lock(&room->lock);
-                    room->pptr[i].child_status = 0;
-                    ++room->navail;
-                    printf("room %d is now free\n", room->pptr[i].child_pid);
-                    Pthread_mutex_unlock(&room->lock);
+                    // Pthread_mutex_lock(&room->lock);
+                    {
+                        std::unique_lock<std::mutex> lock(room->m_mtx);
+                        room->pptr[i].child_status = 0;
+                        ++room->navail;
+                        printf("room %d is now free\n", room->pptr[i].child_pid);
+                    }
+                    // Pthread_mutex_unlock(&room->lock);
                 } else if (rc == 'Q') {
                     // 房间有人离开
-                    Pthread_mutex_lock(&room->lock);
-                    --room->pptr[i].total;
-                    Pthread_mutex_unlock(&room->lock);
+                    // Pthread_mutex_lock(&room->lock);
+                    {
+                        std::unique_lock<std::mutex> lock(room->m_mtx);
+                        --room->pptr[i].total;
+                    }
+                    // Pthread_mutex_unlock(&room->lock);
                 } else {
                     err_msg("read from %d error", room->pptr[i].child_pipefd);
                     continue;
@@ -103,10 +110,10 @@ void process_make(int i, int listen_fd) {
     process_main(i, sockfd[1]);    // sockfd[1]是子进程与父进程进行通信的套接字
 }
 
-void thread_make(int i) {
-    int *arg = (int *) Calloc(1, sizeof(int));
-    *arg = i;
-    Pthread_create(&tptr[i].thread_tid, NULL, thread_main, arg);
-}
+// void thread_make(int i) {
+//     int *arg = (int *) Calloc(1, sizeof(int));
+//     *arg = i;
+//     Pthread_create(&tptr[i].thread_tid, NULL, thread_main, arg);
+// }
 
 

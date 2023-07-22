@@ -2,10 +2,10 @@
 // Created by CEN-KL on 2023/6/11.
 //
 
-#include "pthread.h"
+#include "room.h"
 #include "msg.h"
 
-pthread_mutex_t mlock = PTHREAD_MUTEX_INITIALIZER; // accept lock
+std::mutex mlock;
 extern socklen_t addrlen;
 extern int listenfd;
 extern int nprocesses;
@@ -15,11 +15,8 @@ void doWithUser(int);
 void writeToClient(int, MSG);
 
 // 监听并处理新的连接（创建或加入会议）
-void *thread_main(void *arg) {
-    int i = *(int *) arg;
-    free(arg);
+void thread_main() {
     int connfd;
-    Pthread_detach(pthread_self());
 
     SA *cliaddr;  // 通用的套接字地址结构
     socklen_t clilen;
@@ -27,17 +24,15 @@ void *thread_main(void *arg) {
     char buf[MAXSOCKADDR];
     while (true) {
         clilen = addrlen;
-        // lock accept
-        Pthread_mutex_lock(&mlock);
-        connfd = Accept(listenfd, cliaddr, &clilen);
-        // unlock
-        Pthread_mutex_unlock(&mlock);
+        {
+            std::unique_lock<std::mutex> lock(mlock);
+            connfd = Accept(listenfd, cliaddr, &clilen);
+        }
 
         printf("connection from %s\n", Sock_ntop(buf, MAXSOCKADDR, cliaddr, clilen));
 
         doWithUser(connfd);
     }
-    return NULL;
 }
 
 void doWithUser(int connfd) {
@@ -86,7 +81,7 @@ void doWithUser(int connfd) {
                     } else {
                         // 找一个空房间
                         int i;
-                        Pthread_mutex_lock(&room->lock);
+                        std::unique_lock<std::mutex> lock(room->m_mtx);
 
                         for (i = 0; i < nprocesses; i++) {
                             if (room->pptr[i].child_status == 0) break;
@@ -114,11 +109,10 @@ void doWithUser(int connfd) {
                                 room->pptr[i].total += 1;
                                 room->navail -= 1;
                                 Close(connfd);
-                                Pthread_mutex_unlock(&room->lock);
+                                lock.unlock();
                                 return;
                             }
                         }
-                        Pthread_mutex_unlock(&room->lock);
                     }
                 } else {
                     printf("create meeting data format error\n");
@@ -155,7 +149,7 @@ void doWithUser(int connfd) {
                                 memcpy(msg.ptr, &full, sizeof(uint32_t));
                                 writeToClient(connfd, msg);
                             } else {
-                                Pthread_mutex_lock(&room->lock);
+                                std::unique_lock<std::mutex> lock(room->m_mtx);
                                 char cmd = 'J';
                                 if (write_fd(room->pptr[i].child_pipefd, &cmd, 1, connfd) < 0) {
                                     err_msg("write fd: ");
@@ -164,11 +158,10 @@ void doWithUser(int connfd) {
                                     memcpy(msg.ptr, &roomNo, sizeof(uint32_t));
                                     writeToClient(connfd, msg);
                                     room->pptr[i].total += 1;
-                                    Pthread_mutex_unlock(&room->lock);
+                                    lock.unlock();
                                     Close(connfd);
                                     return;
                                 }
-                                Pthread_mutex_unlock(&room->lock);
                             }
                         } else {
                             msg.ptr = (char *) malloc(msg.len);

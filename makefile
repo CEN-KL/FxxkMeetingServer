@@ -1,5 +1,5 @@
 CC := g++
-CFLAGS := -std=c++11 -g
+CFLAGS := -std=c++17 -g
 SRC := $(wildcard *.cpp)
 OBJ := $(SRC:%.cpp=%.o)
 HEADER := $(wildcard %.h)

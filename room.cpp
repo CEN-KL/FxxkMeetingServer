@@ -3,8 +3,11 @@
 //
 #include "room.h"
 #include "unp.h"
+#include "thread_pool.h"
 #include <map>
 #include <iostream>
+#include <mutex>
+#include <vector>
 
 SEND_QUEUE send_queue; // save data
 
@@ -18,38 +21,36 @@ STATUS volatile roomStatus = ON;
 
 uint32_t getpeerip(int);
 
-typedef struct pool {
+struct Pool {
     fd_set fdset;
-    pthread_mutex_t lock;
-    int owner;
-    int num;
-    int status[1024 + 10];
+
+    std::mutex m_mtx;
+    int owner = 0;
+    int num = 0;
+    std::vector<STATUS> status;
+
     std::map<int, uint32_t> fdToIp;
 
-    pool() {
-        memset(status, 0, sizeof(status));
-        owner = 0;
+    Pool() :owner(0), num(0), status(1024 + 10, STATUS::CLOSE) {
         FD_ZERO(&fdset);
-        lock = PTHREAD_MUTEX_INITIALIZER;
-        num = 0;
     }
 
     void clear_room() {
-        Pthread_mutex_lock(&lock);
+        std::unique_lock<std::mutex> lock(m_mtx);
         roomStatus = CLOSE;
         for (int i = 0; i <= maxfd; i++) {
             if (status[i] == ON)
                 Close(i);
         }
-        memset(status, 0, sizeof(status));
+        std::fill(status.begin(), status.end(), STATUS::CLOSE);
+        
         num = 0;
         owner = 0;
         FD_ZERO(&fdset);
         fdToIp.clear();
         send_queue.clear();
-        Pthread_mutex_unlock(&lock);
     }
-} Pool;
+};
 
 Pool *user_pool = new Pool();
 
@@ -58,14 +59,12 @@ void process_main(int _i, int fd) {
     printf("room %d starting \n", getpid());
     Signal(SIGPIPE, SIG_IGN);
 
-    pthread_t pfd1;
-    int *ptr = (int *) malloc(4);
-    *ptr = fd;
     // 负责监听`doWithUser`里传递的消息（包含新到的客户端连接的描述符）
-    Pthread_create(&pfd1, NULL, accept_fd, ptr);
+    std::thread accept_thread(accept_fd, fd);
     // 多线程负责发送消息
+    ThreadPool sendPool;
     for (int i = 0; i < SENDTHREADSIZE; i++) {
-        Pthread_create(&pfd1, NULL, send_func, NULL);
+        sendPool.submit(send_func);
     }
 
     // 处理已经建立的连接里发送的消息(Select),包括文字、语音、视频帧、关闭摄像头
@@ -161,12 +160,11 @@ void process_main(int _i, int fd) {
  * 监听`dowithuser`里传递的消息（包含客户端连接的文件描述符），因此收到的消息内容为`C`或`J`，把传递过来的描述符加入到`userpool->fdset`中
  * 处理新用户创建/加入会议的事件
  */
-void *accept_fd(void *arg) {
+void accept_fd(int fd) {
     // accept fd from farther
-    Pthread_detach(pthread_self());
-    int fd = *(int *) arg, tfd = -1;  // fd: sockfd[1]      tfd: thread_main传递过来的的connfd
-    free(arg);
-    while (1) {
+    // Pthread_detach(pthread_self());
+    int tfd = -1;  // fd: sockfd[1]      tfd: thread_main传递过来的的connfd
+    for(;;) {
         int c, n;
         // read_fd里的recvmsg会阻塞
         if ((n = read_fd(fd, &c, 1, &tfd)) <= 0)
@@ -181,15 +179,16 @@ void *accept_fd(void *arg) {
 
         if (c == 'C') {
             // 创建会议
-            Pthread_mutex_lock(&user_pool->lock);
-            FD_SET(tfd, &user_pool->fdset);
-            user_pool->owner = tfd;
-            user_pool->fdToIp[tfd] = getpeerip(tfd);
-            user_pool->num++;
-            user_pool->status[tfd] = ON;
-            maxfd = MAX(maxfd, tfd);
-            roomStatus = ON;
-            Pthread_mutex_unlock(&user_pool->lock);
+            {
+                std::unique_lock<std::mutex> lock(user_pool->m_mtx);
+                FD_SET(tfd, &user_pool->fdset);
+                user_pool->owner = tfd;
+                user_pool->fdToIp[tfd] = getpeerip(tfd);
+                user_pool->num++;
+                user_pool->status[tfd] = ON;
+                maxfd = MAX(maxfd, tfd);
+                roomStatus = ON;
+            }
 
             MSG msg;
             msg.msgType = CREATE_MEETING_RESPONSE;
@@ -200,10 +199,10 @@ void *accept_fd(void *arg) {
             msg.len = sizeof(int);
             send_queue.push_msg(msg);
         } else if (c == 'J') {
-            Pthread_mutex_lock(&user_pool->lock);
+            std::unique_lock<std::mutex> lock(user_pool->m_mtx);
             if (roomStatus == CLOSE) {
                 close(tfd);
-                Pthread_mutex_unlock(&user_pool->lock);
+                lock.unlock();
                 continue;
             } else {
                 FD_SET(tfd, &user_pool->fdset);
@@ -211,9 +210,8 @@ void *accept_fd(void *arg) {
                 user_pool->status[tfd] = ON;
                 maxfd = MAX(tfd, maxfd);
                 user_pool->fdToIp[tfd] = getpeerip(tfd);
-                Pthread_mutex_unlock(&user_pool->lock);
+                lock.unlock();
 
-                // broadcast to others
                 MSG msg;
                 memset(&msg, 0, sizeof(MSG));
                 msg.msgType = PARTNER_JOIN;
@@ -244,11 +242,9 @@ void *accept_fd(void *arg) {
             }
         }
     }
-    return NULL;
 }
 
-void *send_func(void *arg) {
-    Pthread_detach(pthread_self());
+void send_func() {
     char *sendbuf = (char *)malloc(4 * MB);
     while (true) {
         memset(sendbuf, 0, 4 * MB);
@@ -276,7 +272,7 @@ void *send_func(void *arg) {
         len += msg.len;
         sendbuf[len++] = '#';
 
-        Pthread_mutex_lock(&user_pool->lock);
+        std::unique_lock<std::mutex> lock(user_pool->m_mtx);
         if (msg.msgType == CREATE_MEETING_RESPONSE)
         {
             if (writen(msg.targetfd, sendbuf, len) < 0)
@@ -308,7 +304,7 @@ void *send_func(void *arg) {
                 }
             }
         }
-        Pthread_mutex_unlock(&user_pool->lock);
+        lock.unlock();
 
         if (msg.ptr)
         {
@@ -317,7 +313,6 @@ void *send_func(void *arg) {
         }
     }
     free(sendbuf);
-    return NULL;
 }
 
 void fdclose(int fd, int pipefd)
@@ -336,14 +331,15 @@ void fdclose(int fd, int pipefd)
     else
     {
         uint32_t ip;
-        Pthread_mutex_lock(&user_pool->lock);
-        ip = user_pool->fdToIp[fd];
-        FD_CLR(fd, &user_pool->fdset);
-        user_pool->num--;
-        user_pool->status[fd] = CLOSE;
-        if (fd == maxfd)
-            --maxfd;
-        Pthread_mutex_unlock(&user_pool->lock);
+        {
+            std::unique_lock<std::mutex> lock(user_pool->m_mtx);
+            ip = user_pool->fdToIp[fd];
+            FD_CLR(fd, &user_pool->fdset);
+            user_pool->num--;
+            user_pool->status[fd] = CLOSE;
+            if (fd == maxfd)
+                --maxfd;
+        }
 
         char cmd = 'Q';
         if (write(pipefd, &cmd, 1) < 1)
